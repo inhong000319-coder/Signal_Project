@@ -200,46 +200,60 @@ SENT → DELIVERED → READ (단조 증가)
 
 ```mermaid
 flowchart TD
+  Client["클라이언트 (React)"] -->|"REST API 요청 (인증·메시지 전송·상태변경)"| RestEntry["REST Entry (Controller)"]
+  Client -->|"WebSocket 구독/푸시"| WsClient["WebSocket 연결 계층 (/ws)"]
 
-Client -->|WebSocket| EntryWS[WebSocket Entry]
-Client -->|REST| EntryREST[REST Entry]
+  RestEntry --> Application["Application Service (UseCase)"]
+  Application --> Domain["Domain Layer (도메인 규칙)"]
+  Application --> Repository["Repository Interface"]
+  Repository --> DB["PostgreSQL (Source of Truth)"]
 
-EntryWS --> UseCase[Application UseCase]
-EntryREST --> UseCase
+  Application -->|"도메인 이벤트 발행"| EventBus["Event Bus"]
+  EventBus --> WsEventHandler["WebSocketEventHandler"]
+  WsEventHandler -->|"AFTER_COMMIT + Async"| Publisher["WebSocketPublisher"]
+  Publisher -->|"SimpMessagingTemplate"| WsClient
+  WsClient -->|"subscribed topic 수신"| Client
 
-UseCase --> Domain
-UseCase --> Repository
+  classDef good fill:#eef6ff,stroke:#2b6cb0,stroke-width:1.2px;
+  class RestEntry,Application,Domain,Repository,EventBus,WsEventHandler,Publisher good;
 
-Repository --> DB[(PostgreSQL DB)]
 
-UseCase -->|After Commit| WebSocketPublisher
-WebSocketPublisher --> Client
 ```
 
 ## Message Delivery Sequence Diagram
 
 ```mermaid
 sequenceDiagram
+    autonumber
+    participant Sender as "Sender (Client)"
+    participant Rest as "Message REST API"
+    participant App as "MessageSendService"
+    participant DB as "PostgreSQL"
+    participant Tx as "WebSocketEventHandler\n(AFTER_COMMIT)"
+    participant Broker as "WebSocket Broker (/topic)"
+    participant Receiver as "Receiver (Client)"
 
-participant Sender
-participant WS as WebSocket
-participant UC as MessageSendUseCase
-participant DB
+    Sender->>Rest: POST /api/messages\n(conversationId, content, clientMessageKey)
+    Rest->>App: send(command)
 
-Sender->>WS: SEND_MESSAGE
-WS->>UC: route()
+    App->>DB: 권한/멤버십 검증 + 중복키 확인
+    alt 중복 요청 (clientMessageKey)
+        DB-->>App: DataIntegrityViolation\n(또는 findBySenderAndClientKey)
+        App-->>Rest: 기존 메시지로 응답(멱등성 보장)
+        Rest-->>Sender: 200 OK\n(messageId, ...), duplicate 처리
+    else 최초 요청
+        App->>DB: INSERT Message (append-only)
+        App->>DB: INSERT MessageState(SENT)
+        DB-->>App: 트랜잭션 커밋
+        App-->>Rest: SendMessageResult 반환
+        Rest-->>Sender: 200 OK\n(messageId, ...)
+        App->>Tx: MessageSentEvent publish
+        Note right of Tx: @TransactionalEventListener(phase = AFTER_COMMIT)\n@Async로 실시간 push
+        Tx->>Broker: publishMessageSent(payload)
+        Broker-->>Sender: /topic/conversations/{id}/messages
+        Broker-->>Receiver: /topic/conversations/{id}/messages
+    end
 
-UC->>UC: 권한 검증
-UC->>UC: 중복 검사(clientMessageKey)
-
-UC->>DB: INSERT Message
-UC->>DB: INSERT MessageState(SENT)
-
-DB-->>UC: commit
-
-UC-->>Sender: ACK
-UC-->>WS: publish event
-WS-->>Receiver: push message
 ```
 
 ## State Transition Diagram
@@ -256,58 +270,130 @@ DELIVERED --> READ
 
 ```mermaid
 sequenceDiagram
+    participant Reader as Reader(Client)
+    participant REST as Read API (ReadController)
+    participant UC as ReadMarkService (Application)
+    participant DB as PostgreSQL
+    participant Tx as WebSocketEventHandler
+    participant Broker as WebSocket Broker (/topic)
 
-participant Receiver
-participant WS
-participant UC as StateTransitionUseCase
-participant DB
+    Reader->>REST: POST /api/read {conversationId, messageId}
+    REST->>UC: markRead(command, userId)
+    UC->>UC: 회원/참여자 검증 + sender 방어
+    UC->>DB: message 조회 및 conversation 소속 검증
+    UC->>DB: MessageState 조회/저장 또는 상태 전이(READ, 단조 증가)
+    UC->>DB: SyncCursor(lastRead) 업데이트
+    UC->>UC: MessageReadEvent publish
+    UC-->>REST: ReadMarkResult
+    REST-->>Reader: 200 OK (effective lastReadMessageId)
 
-Receiver->>WS: MESSAGE_READ
-WS->>UC: route()
+    DB-->>Tx: Transaction commit
+    Tx->>Broker: publishReadUpdate(MessageReadEvent) [AFTER_COMMIT, @Async]
+    Broker-->>Reader: /topic/conversations/{id}/reads 구독 메시지
+    Broker-->>Others: 같은 대화방 참가자 구독자에게 read 업데이트 전달
 
-UC->>UC: receiver 검증
-UC->>DB: INSERT MessageState(READ)
-UC->>DB: UPDATE SyncCursor(lastRead)
-
-DB-->>UC: commit
-
-UC-->>Sender: push read update
 ```
 
 ## Reconnect & Sync Diagram
 
 ```mermaid
 sequenceDiagram
+    participant Client as Client
+    participant WS as WebSocket Broker
+    participant REST as /api/read/reconnect
+    participant UC as ReconnectUseCase
+    participant DB as PostgreSQL
 
-participant Client
-participant WS
-participant UC as ReconnectSyncUseCase
-participant DB
+    Client->>WS: CONNECT + SUBSCRIBE (/topic/...)
+    WS-->>Client: 연결/구독 완료
 
-Client->>WS: CONNECT
-WS->>UC: RECONNECT_SYNC
+    Client->>REST: POST /api/read/reconnect\n{conversationId, clientLastDeliveredMessageId, clientLastReadMessageId, limit}
+    REST->>UC: reconnect(query)
 
-UC->>DB: load SyncCursor
-UC->>DB: load Messages after cursor
-UC->>DB: load States
+    UC->>DB: 대화 참여자/권한 검증
+    UC->>DB: SyncCursor 조회 (server 기준 cursor)
+    UC->>DB: cursor 이후 Message 목록 조회
+    UC->>DB: 관련 MessageState 조회
+    DB-->>UC: 동기화 대상 데이터 반환
 
-DB-->>UC: data
+    UC-->>REST: ReconnectResponse\n(effectiveCursor, messages, states)
+    REST-->>Client: 동기화 결과 응답
 
-UC-->>Client: replay messages
-UC-->>Client: replay states
+    Note over Client,WS: 이후 WebSocket은 push 채널로\n실시간 상태/메시지 업데이트 수신
+
 ```
 
 ## ERD Diagram
 
 ```mermaid
 erDiagram
+    USER {
+        BIGINT id PK
+        VARCHAR login_id UK
+        VARCHAR user_code UK
+        VARCHAR display_name
+        TIMESTAMP created_at
+    }
 
-USER ||--o{ FRIENDSHIP : has
-USER ||--o{ CONVERSATION_MEMBER : participates
-CONVERSATION ||--o{ CONVERSATION_MEMBER : contains
-CONVERSATION ||--o{ MESSAGE : has
-MESSAGE ||--o{ MESSAGE_STATE : tracks
-USER ||--o{ MESSAGE_STATE : owns
-CONVERSATION ||--o{ SYNC_CURSOR : has
-USER ||--o{ SYNC_CURSOR : owns
+    CONVERSATION {
+        BIGINT id PK
+        VARCHAR name
+        BOOLEAN active
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    CONVERSATION_MEMBER {
+        BIGINT conversation_id FK
+        BIGINT user_id FK
+        TIMESTAMP joined_at
+    }
+
+    MESSAGE {
+        BIGINT id PK
+        BIGINT conversation_id FK
+        BIGINT sender_user_id FK
+        TEXT content
+        VARCHAR client_message_key
+        TIMESTAMP created_at
+    }
+
+    MESSAGE_STATE {
+        BIGINT message_id FK
+        BIGINT user_id FK
+        VARCHAR state
+        TIMESTAMP updated_at
+    }
+
+    FRIENDSHIP {
+        BIGINT id PK
+        BIGINT requester_user_id FK
+        BIGINT addressee_user_id FK
+        VARCHAR status
+        TIMESTAMP requested_at
+        TIMESTAMP decided_at
+    }
+
+    SYNC_CURSOR {
+        BIGINT conversation_id FK
+        BIGINT user_id FK
+        BIGINT last_delivered_message_id
+        BIGINT last_read_message_id
+        TIMESTAMP updated_at
+    }
+
+    USER ||--o{ CONVERSATION_MEMBER : participates
+    USER ||--o{ MESSAGE : sends
+    USER ||--o{ MESSAGE_STATE : has_state_for
+    USER ||--o{ FRIENDSHIP : requests
+    USER ||--o{ FRIENDSHIP : receives
+    USER ||--o{ SYNC_CURSOR : owns
+
+    CONVERSATION ||--o{ CONVERSATION_MEMBER : contains
+    CONVERSATION ||--o{ MESSAGE : has
+    CONVERSATION ||--o{ SYNC_CURSOR : tracks
+
+    MESSAGE ||--o{ MESSAGE_STATE : has
+    CONVERSATION_MEMBER }o--|| CONVERSATION : belongs_to
+
 ```
