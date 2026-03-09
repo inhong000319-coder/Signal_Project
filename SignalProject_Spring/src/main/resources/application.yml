@@ -1,0 +1,35 @@
+﻿spring:
+  application:
+    name: signal
+  datasource:
+    url: jdbc:postgresql://localhost:5432/signal
+    username: signal
+    password: signal
+  sql:
+    init:
+      mode: always
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: true
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+logging:
+  level:
+    org.hibernate.SQL: debug
+    org.hibernate.orm.jdbc.bind: trace
+
+signal:
+  security:
+    jwt:
+      issuer: signal
+      access-token-exp-minutes: 15
+      refresh-token-exp-days: 30
+      secret: change-me-please-change-me-please
+    login:
+      max-failures: 5
+      lock-minutes: 10
